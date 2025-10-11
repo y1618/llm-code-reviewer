@@ -21,7 +21,8 @@ class CodeReviewer:
         review_focus: List[str],
         language: str,
         system_prompt: Optional[str] = None,
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        debug: bool = False
     ):
         self.api_url = api_url.rstrip('/')
         self.model = model
@@ -33,6 +34,7 @@ class CodeReviewer:
         self.language = language
         self.system_prompt = system_prompt
         self.api_key = api_key
+        self.debug = debug
         self.results = []
         
         self.supported_extensions = {
@@ -224,6 +226,11 @@ Be specific about line numbers and provide clear, actionable feedback."""
             if self.api_key:
                 headers['Authorization'] = f'Bearer {self.api_key}'
             
+            if self.debug:
+                print(f"[DEBUG] API URL: {self.api_url}/chat/completions", file=sys.stderr)
+                print(f"[DEBUG] Model: {self.model}", file=sys.stderr)
+                print(f"[DEBUG] プロンプト長: {len(prompt)} 文字", file=sys.stderr)
+            
             response = requests.post(
                 f"{self.api_url}/chat/completions",
                 json={
@@ -252,13 +259,32 @@ Be specific about line numbers and provide clear, actionable feedback."""
                     content = content[:-3]
                 content = content.strip()
                 
-                return json.loads(content)
+                try:
+                    parsed = json.loads(content)
+                    if self.debug:
+                        print(f"[DEBUG] JSON解析成功", file=sys.stderr)
+                    return parsed
+                except json.JSONDecodeError as je:
+                    print(f"JSON解析エラー: {je}", file=sys.stderr)
+                    print(f"LLMレスポンスの最初の1000文字:", file=sys.stderr)
+                    print(content[:1000], file=sys.stderr)
+                    if len(content) > 1000:
+                        print(f"...", file=sys.stderr)
+                        print(f"最後の500文字:", file=sys.stderr)
+                        print(content[-500:], file=sys.stderr)
+                    print(f"(合計 {len(content)} 文字)", file=sys.stderr)
+                    return None
             else:
                 print(f"エラー: APIがステータス {response.status_code} を返しました: {response.text}", file=sys.stderr)
                 return None
                 
+        except json.JSONDecodeError as je:
+            print(f"JSON解析エラー: {je}", file=sys.stderr)
+            return None
         except Exception as e:
             print(f"LLM呼び出しエラー: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             return None
     
     def review_file(self, file_path: Path):
@@ -372,6 +398,11 @@ def main():
         '--api-key',
         help='API認証キー（OpenWebUI等で必要な場合）'
     )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='デバッグモードを有効化（詳細なログ出力）'
+    )
     
     args = parser.parse_args()
     
@@ -409,7 +440,8 @@ def main():
         review_focus=args.review_focus,
         language=args.language,
         system_prompt=system_prompt,
-        api_key=args.api_key
+        api_key=args.api_key,
+        debug=args.debug
     )
     
     reviewer.run()
