@@ -8,6 +8,10 @@ from typing import List, Dict, Any, Optional
 import requests
 import fnmatch
 
+MAX_FILES_PER_BATCH = 5  # Maximum number of files to batch together
+BATCH_TOKEN_RATIO = 0.3  # Use 30% of context length for batch content (leaving room for prompt overhead)
+API_TIMEOUT_SECONDS = 300  # 5 minutes timeout for LLM API calls
+
 
 class CodeReviewer:
     def __init__(
@@ -110,7 +114,10 @@ class CodeReviewer:
         batches = []
         current_batch = []
         current_tokens = 0
-        max_batch_tokens = int(self.context_length * 0.8)
+        max_batch_tokens = int(self.context_length * BATCH_TOKEN_RATIO)
+        
+        if self.debug:
+            print(f"[DEBUG] 最大バッチトークン数: {max_batch_tokens}, 最大ファイル数/バッチ: {MAX_FILES_PER_BATCH}", file=sys.stderr)
         
         files_by_dir = {}
         for file_path in files:
@@ -134,14 +141,19 @@ class CodeReviewer:
                             current_tokens = 0
                         batches.append([file_path])
                     else:
-                        if current_tokens + file_tokens > max_batch_tokens and current_batch:
+                        would_exceed_tokens = current_tokens + file_tokens > max_batch_tokens
+                        would_exceed_file_count = len(current_batch) >= MAX_FILES_PER_BATCH
+                        
+                        if (would_exceed_tokens or would_exceed_file_count) and current_batch:
                             batches.append(current_batch)
                             current_batch = []
                             current_tokens = 0
                         
                         current_batch.append(file_path)
                         current_tokens += file_tokens
-                except Exception:
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] ファイル読み込みエラー {file_path}: {e}", file=sys.stderr)
                     if current_batch:
                         batches.append(current_batch)
                         current_batch = []
@@ -278,7 +290,7 @@ Be specific about line numbers and provide clear, actionable feedback."""
             if self.debug:
                 print(f"[DEBUG] API URL: {self.api_url}/chat/completions", file=sys.stderr)
                 print(f"[DEBUG] Model: {self.model}", file=sys.stderr)
-                print(f"[DEBUG] プロンプト長: {len(prompt)} 文字", file=sys.stderr)
+                print(f"[DEBUG] プロンプト長: {self.estimate_tokens(prompt)} トークン", file=sys.stderr)
             
             response = requests.post(
                 f"{self.api_url}/chat/completions",
@@ -292,12 +304,18 @@ Be specific about line numbers and provide clear, actionable feedback."""
                     "max_tokens": 2000
                 },
                 headers=headers,
-                timeout=120
+                timeout=API_TIMEOUT_SECONDS
             )
+            
+            if self.debug:
+                print(f"[DEBUG] LLM応答ステータス: {response.status_code}", file=sys.stderr)
             
             if response.status_code == 200:
                 result = response.json()
                 content = result['choices'][0]['message']['content']
+                
+                if self.debug:
+                    print(f"[DEBUG] LLM応答プレビュー: {content[:200]}...", file=sys.stderr)
                 
                 content = content.strip()
                 if content.startswith('```json'):
@@ -315,25 +333,24 @@ Be specific about line numbers and provide clear, actionable feedback."""
                     return parsed
                 except json.JSONDecodeError as je:
                     print(f"JSON解析エラー: {je}", file=sys.stderr)
-                    print(f"LLMレスポンスの最初の1000文字:", file=sys.stderr)
-                    print(content[:1000], file=sys.stderr)
-                    if len(content) > 1000:
-                        print(f"...", file=sys.stderr)
-                        print(f"最後の500文字:", file=sys.stderr)
-                        print(content[-500:], file=sys.stderr)
-                    print(f"(合計 {len(content)} 文字)", file=sys.stderr)
+                    if self.debug:
+                        print(f"[DEBUG] 解析失敗した内容:\n{content[:500]}", file=sys.stderr)
                     return None
             else:
                 print(f"エラー: APIがステータス {response.status_code} を返しました: {response.text}", file=sys.stderr)
                 return None
                 
+        except requests.exceptions.Timeout as e:
+            print(f"LLMタイムアウトエラー ({API_TIMEOUT_SECONDS}秒): {e}", file=sys.stderr)
+            return None
         except json.JSONDecodeError as je:
             print(f"JSON解析エラー: {je}", file=sys.stderr)
             return None
         except Exception as e:
             print(f"LLM呼び出しエラー: {e}", file=sys.stderr)
-            import traceback
-            traceback.print_exc(file=sys.stderr)
+            if self.debug:
+                import traceback
+                traceback.print_exc(file=sys.stderr)
             return None
     
     def review_file(self, file_path: Path):
@@ -446,6 +463,9 @@ For multiple files, return an array: [{{"file": "...", "reviews": [...]}}, ...]
         
         if self.debug:
             print(f"[DEBUG] {total_batches}個のバッチを作成しました", file=sys.stderr)
+            for i, batch in enumerate(batches, 1):
+                batch_tokens = sum(self.estimate_tokens(f.read_text(encoding='utf-8', errors='ignore')) for f in batch)
+                print(f"[DEBUG] バッチ {i}: {len(batch)}ファイル, 約{batch_tokens}トークン", file=sys.stderr)
         
         processed_files = 0
         for batch_idx, batch in enumerate(batches, 1):
