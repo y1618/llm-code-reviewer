@@ -4,7 +4,7 @@
 
 ## 特徴
 
-- 🤖 ローカルLLM（LM Studio経由）を使用した高度なコードレビュー
+- 🤖 ローカルLLM（LM Studio、OpenWebUI対応）を使用した高度なコードレビュー
 - 🎯 カスタマイズ可能なレビュー焦点（セキュリティ、パフォーマンス、PEP8等）
 - 🌍 多言語対応（日本語・英語、デフォルトは日本語）
 - 🔧 カスタムシステムプロンプトのサポート
@@ -13,6 +13,7 @@
 - 📊 大規模ファイルの自動分割（コンテキスト長を考慮）
 - 🎨 JSON形式での詳細な結果出力
 - 🚫 除外パターンのサポート（SVNリポジトリ対応）
+- 📈 リアルタイム進捗表示（パーセント表示）
 
 ## 必要要件
 
@@ -91,6 +92,15 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
   --exclude "install/*"
 ```
 
+### OpenWebUI APIの使用
+
+```bash
+docker run -v /path/to/your/code:/code llm-code-reviewer \
+  --api-url http://your-openwebui-server:3000/v1 \
+  --api-key your-api-key-here \
+  --model your-model-name
+```
+
 ## コマンドライン引数
 
 | 引数 | デフォルト値 | 説明 |
@@ -105,6 +115,7 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
 | `--language` | `ja` | 出力言語（`ja` または `en`） |
 | `--system-prompt` | - | カスタムシステムプロンプト |
 | `--prompt-file` | - | システムプロンプトを含むファイルのパス |
+| `--api-key` | - | API認証キー（OpenWebUI等で必要な場合） |
 
 ### レビュー焦点のオプション
 
@@ -171,6 +182,26 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
 3. ローカルサーバーを起動
 4. サーバーのIPアドレスとポートを確認（例：`http://192.168.50.136:1234`）
 5. このツールから接続
+
+## OpenWebUIの設定
+
+1. OpenWebUIサーバーを起動
+2. APIキーを取得（設定画面から）
+3. 使用するモデルを選択
+4. このツールから`--api-url`と`--api-key`を指定して接続
+
+## 進捗表示
+
+実行中は、以下のような進捗表示が出力されます：
+
+```
+10個のファイルが見つかりました
+
+[1/10 (10.0%)] レビュー中: src/example.py
+[2/10 (20.0%)] レビュー中: src/utils.py
+[3/10 (30.0%)] レビュー中: src/main.cpp
+...
+```
 
 ## 使用例
 

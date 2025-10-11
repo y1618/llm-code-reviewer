@@ -20,7 +20,8 @@ class CodeReviewer:
         code_dir: str,
         review_focus: List[str],
         language: str,
-        system_prompt: Optional[str] = None
+        system_prompt: Optional[str] = None,
+        api_key: Optional[str] = None
     ):
         self.api_url = api_url.rstrip('/')
         self.model = model
@@ -31,6 +32,7 @@ class CodeReviewer:
         self.review_focus = review_focus
         self.language = language
         self.system_prompt = system_prompt
+        self.api_key = api_key
         self.results = []
         
         self.supported_extensions = {
@@ -218,6 +220,10 @@ Be specific about line numbers and provide clear, actionable feedback."""
                 else "You are an expert code reviewer."
             )
             
+            headers = {}
+            if self.api_key:
+                headers['Authorization'] = f'Bearer {self.api_key}'
+            
             response = requests.post(
                 f"{self.api_url}/chat/completions",
                 json={
@@ -229,6 +235,7 @@ Be specific about line numbers and provide clear, actionable feedback."""
                     "temperature": 0.1,
                     "max_tokens": 2000
                 },
+                headers=headers,
                 timeout=120
             )
             
@@ -261,8 +268,6 @@ Be specific about line numbers and provide clear, actionable feedback."""
             print(f"{file_path}の読み込みエラー: {e}", file=sys.stderr)
             return
         
-        print(f"レビュー中: {file_path.relative_to(self.code_dir)}")
-        
         chunks = self.split_file_content(content, file_path)
         file_reviews = []
         
@@ -284,13 +289,16 @@ Be specific about line numbers and provide clear, actionable feedback."""
     
     def run(self):
         files = self.find_files()
-        print(f"{len(files)}個のファイルが見つかりました")
+        total_files = len(files)
+        print(f"{total_files}個のファイルが見つかりました")
         
-        for file_path in files:
+        for idx, file_path in enumerate(files, 1):
+            progress = (idx / total_files) * 100
+            print(f"\n[{idx}/{total_files} ({progress:.1f}%)] レビュー中: {file_path.relative_to(self.code_dir)}")
             self.review_file(file_path)
         
         output = {
-            'total_files': len(files),
+            'total_files': total_files,
             'files_with_issues': len(self.results),
             'results': self.results
         }
@@ -298,9 +306,9 @@ Be specific about line numbers and provide clear, actionable feedback."""
         with open(self.output_path, 'w', encoding='utf-8') as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
         
-        print(f"\nレビュー完了。結果を保存しました: {self.output_path}")
-        print(f"レビューしたファイル数: {len(files)}")
-        print(f"問題が見つかったファイル数: {len(self.results)}")
+        print(f"\n✓ レビュー完了。結果を保存しました: {self.output_path}")
+        print(f"  レビューしたファイル数: {total_files}")
+        print(f"  問題が見つかったファイル数: {len(self.results)}")
 
 
 def main():
@@ -360,6 +368,10 @@ def main():
         '--prompt-file',
         help='システムプロンプトを含むファイルのパス'
     )
+    parser.add_argument(
+        '--api-key',
+        help='API認証キー（OpenWebUI等で必要な場合）'
+    )
     
     args = parser.parse_args()
     
@@ -396,7 +408,8 @@ def main():
         code_dir=args.code_dir,
         review_focus=args.review_focus,
         language=args.language,
-        system_prompt=system_prompt
+        system_prompt=system_prompt,
+        api_key=args.api_key
     )
     
     reviewer.run()
