@@ -14,6 +14,7 @@
 - 🎨 JSON形式での詳細な結果出力
 - 🚫 除外パターンのサポート（SVNリポジトリ対応）
 - 📈 リアルタイム進捗表示（パーセント表示）
+- 🔗 ファイルバッチング：小さいファイルを自動的にグループ化して、ファイル間の依存関係を考慮したレビュー
 
 ## 必要要件
 
@@ -101,6 +102,23 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
   --model your-model-name
 ```
 
+### ファイルバッチングの調整
+
+デフォルトでは、10000トークン（約40KB）以下のファイルは同じディレクトリ内でまとめてレビューされます。
+これにより、グローバル変数やファイル間の依存関係を考慮したレビューが可能になります。
+
+バッチングを無効化する場合：
+```bash
+docker run -v /path/to/your/code:/code llm-code-reviewer \
+  --batch-threshold 999999
+```
+
+より積極的にバッチングする場合：
+```bash
+docker run -v /path/to/your/code:/code llm-code-reviewer \
+  --batch-threshold 5000
+```
+
 ## コマンドライン引数
 
 | 引数 | デフォルト値 | 説明 |
@@ -116,6 +134,8 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
 | `--system-prompt` | - | カスタムシステムプロンプト |
 | `--prompt-file` | - | システムプロンプトを含むファイルのパス |
 | `--api-key` | - | API認証キー（OpenWebUI等で必要な場合） |
+| `--debug` | `False` | デバッグモードを有効化（詳細なログ出力） |
+| `--batch-threshold` | `10000` | バッチ処理の閾値（トークン数）。この値より小さいファイルはまとめてレビュー |
 
 ### レビュー焦点のオプション
 
@@ -198,10 +218,15 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
 10個のファイルが見つかりました
 
 [1/10 (10.0%)] レビュー中: src/example.py
-[2/10 (20.0%)] レビュー中: src/utils.py
-[3/10 (30.0%)] レビュー中: src/main.cpp
+[バッチ 2/5 (40.0%)] 3ファイルをまとめてレビュー中:
+  - src/utils.py
+  - src/helper.py
+  - src/config.py
+[5/10 (50.0%)] レビュー中: src/main.cpp
 ...
 ```
+
+小さいファイルは自動的にバッチ処理され、関連ファイルを一緒にレビューします。
 
 ## 使用例
 

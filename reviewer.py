@@ -22,7 +22,8 @@ class CodeReviewer:
         language: str,
         system_prompt: Optional[str] = None,
         api_key: Optional[str] = None,
-        debug: bool = False
+        debug: bool = False,
+        batch_threshold: int = 10000
     ):
         self.api_url = api_url.rstrip('/')
         self.model = model
@@ -35,6 +36,7 @@ class CodeReviewer:
         self.system_prompt = system_prompt
         self.api_key = api_key
         self.debug = debug
+        self.batch_threshold = batch_threshold
         self.results = []
         
         self.supported_extensions = {
@@ -103,6 +105,53 @@ class CodeReviewer:
                 if file_path.is_file() and not self.should_exclude(file_path):
                     files.append(file_path)
         return sorted(files)
+    
+    def batch_files(self, files: List[Path]) -> List[List[Path]]:
+        batches = []
+        current_batch = []
+        current_tokens = 0
+        max_batch_tokens = int(self.context_length * 0.8)
+        
+        files_by_dir = {}
+        for file_path in files:
+            parent = file_path.parent
+            if parent not in files_by_dir:
+                files_by_dir[parent] = []
+            files_by_dir[parent].append(file_path)
+        
+        for directory in sorted(files_by_dir.keys()):
+            dir_files = sorted(files_by_dir[directory])
+            
+            for file_path in dir_files:
+                try:
+                    content = file_path.read_text(encoding='utf-8')
+                    file_tokens = self.estimate_tokens(content)
+                    
+                    if file_tokens > self.batch_threshold:
+                        if current_batch:
+                            batches.append(current_batch)
+                            current_batch = []
+                            current_tokens = 0
+                        batches.append([file_path])
+                    else:
+                        if current_tokens + file_tokens > max_batch_tokens and current_batch:
+                            batches.append(current_batch)
+                            current_batch = []
+                            current_tokens = 0
+                        
+                        current_batch.append(file_path)
+                        current_tokens += file_tokens
+                except Exception:
+                    if current_batch:
+                        batches.append(current_batch)
+                        current_batch = []
+                        current_tokens = 0
+                    batches.append([file_path])
+        
+        if current_batch:
+            batches.append(current_batch)
+        
+        return batches
     
     def estimate_tokens(self, text: str) -> int:
         return len(text) // 4
@@ -313,15 +362,105 @@ Be specific about line numbers and provide clear, actionable feedback."""
                 'reviews': file_reviews
             })
     
+    def review_batch(self, file_paths: List[Path]):
+        if len(file_paths) == 1:
+            self.review_file(file_paths[0])
+            return
+        
+        if self.language == 'ja':
+            combined_content = f"複数の関連ファイルをレビューします（{len(file_paths)}ファイル）:\n\n"
+        else:
+            combined_content = f"Reviewing {len(file_paths)} related files together:\n\n"
+        
+        file_contents = []
+        for file_path in file_paths:
+            try:
+                content = file_path.read_text(encoding='utf-8')
+                relative_path = file_path.relative_to(self.code_dir)
+                file_contents.append({
+                    'path': file_path,
+                    'relative_path': relative_path,
+                    'content': content
+                })
+                combined_content += f"--- File: {relative_path} ---\n{content}\n\n"
+            except Exception as e:
+                print(f"{file_path}の読み込みエラー: {e}", file=sys.stderr)
+        
+        if not file_contents:
+            return
+        
+        language = self.supported_extensions.get(file_paths[0].suffix, 'Unknown')
+        focus_instructions = self.get_focus_instructions()
+        
+        if self.language == 'ja':
+            prompt = f"""あなたは{language}とROS2開発に精通したエキスパートコードレビュアーです。
+以下の複数の関連ファイルをまとめてレビューし、ファイル間の依存関係や相互作用も考慮してください。
+
+{focus_instructions}
+
+{combined_content}
+
+各ファイルごとに問題点を JSON 形式で返してください:
+{{"file": "相対パス", "reviews": [{{"line": 行番号, "severity": "error/warning/info", "message": "指摘内容"}}]}}
+
+複数ファイルがある場合は配列で返してください: [{{"file": "...", "reviews": [...]}}, ...]
+"""
+        else:
+            prompt = f"""You are an expert code reviewer specializing in {language} and ROS2 development.
+Review the following related files together, considering cross-file dependencies and interactions.
+
+{focus_instructions}
+
+{combined_content}
+
+Return issues in JSON format for each file:
+{{"file": "relative_path", "reviews": [{{"line": line_number, "severity": "error/warning/info", "message": "issue description"}}]}}
+
+For multiple files, return an array: [{{"file": "...", "reviews": [...]}}, ...]
+"""
+        
+        result = self.call_llm(prompt)
+        
+        if result:
+            if isinstance(result, dict) and 'file' in result:
+                if result.get('reviews'):
+                    self.results.append(result)
+            elif isinstance(result, list):
+                for file_result in result:
+                    if file_result.get('reviews'):
+                        self.results.append(file_result)
+            elif isinstance(result, dict) and 'reviews' in result:
+                if result.get('reviews'):
+                    self.results.append({
+                        'file': str(file_paths[0].relative_to(self.code_dir)),
+                        'reviews': result['reviews']
+                    })
+    
     def run(self):
         files = self.find_files()
         total_files = len(files)
         print(f"{total_files}個のファイルが見つかりました")
         
-        for idx, file_path in enumerate(files, 1):
-            progress = (idx / total_files) * 100
-            print(f"\n[{idx}/{total_files} ({progress:.1f}%)] レビュー中: {file_path.relative_to(self.code_dir)}")
-            self.review_file(file_path)
+        batches = self.batch_files(files)
+        total_batches = len(batches)
+        
+        if self.debug:
+            print(f"[DEBUG] {total_batches}個のバッチを作成しました", file=sys.stderr)
+        
+        processed_files = 0
+        for batch_idx, batch in enumerate(batches, 1):
+            batch_progress = (batch_idx / total_batches) * 100
+            file_progress = (processed_files / total_files) * 100
+            
+            if len(batch) == 1:
+                print(f"\n[{processed_files + 1}/{total_files} ({file_progress:.1f}%)] レビュー中: {batch[0].relative_to(self.code_dir)}")
+            else:
+                print(f"\n[バッチ {batch_idx}/{total_batches} ({batch_progress:.1f}%)] {len(batch)}ファイルをまとめてレビュー中:")
+                for f in batch:
+                    print(f"  - {f.relative_to(self.code_dir)}")
+            
+            self.review_batch(batch)
+            processed_files += len(batch)
         
         output = {
             'total_files': total_files,
@@ -334,6 +473,7 @@ Be specific about line numbers and provide clear, actionable feedback."""
         
         print(f"\n✓ レビュー完了。結果を保存しました: {self.output_path}")
         print(f"  レビューしたファイル数: {total_files}")
+        print(f"  バッチ数: {total_batches}")
         print(f"  問題が見つかったファイル数: {len(self.results)}")
 
 
@@ -403,6 +543,12 @@ def main():
         action='store_true',
         help='デバッグモードを有効化（詳細なログ出力）'
     )
+    parser.add_argument(
+        '--batch-threshold',
+        type=int,
+        default=10000,
+        help='ファイルをバッチ処理する閾値（トークン数）。この値より小さいファイルはまとめてレビューされます (デフォルト: 10000)'
+    )
     
     args = parser.parse_args()
     
@@ -441,7 +587,8 @@ def main():
         language=args.language,
         system_prompt=system_prompt,
         api_key=args.api_key,
-        debug=args.debug
+        debug=args.debug,
+        batch_threshold=args.batch_threshold
     )
     
     reviewer.run()
