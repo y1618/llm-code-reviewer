@@ -1,0 +1,229 @@
+# LLM Code Reviewer
+
+ローカルLLMを使用してプロジェクトのコードレビューを自動実行するDockerベースのツールです。
+
+## 特徴
+
+- 🤖 ローカルLLM（LM Studio経由）を使用した高度なコードレビュー
+- 🎯 カスタマイズ可能なレビュー焦点（セキュリティ、パフォーマンス、PEP8等）
+- 🌍 多言語対応（日本語・英語、デフォルトは日本語）
+- 🔧 カスタムシステムプロンプトのサポート
+- 🚀 ROS2プロジェクト向けに最適化（Python、C++対応）
+- 📦 Dockerコンテナで実行し、環境を分離
+- 📊 大規模ファイルの自動分割（コンテキスト長を考慮）
+- 🎨 JSON形式での詳細な結果出力
+- 🚫 除外パターンのサポート（SVNリポジトリ対応）
+
+## 必要要件
+
+- Docker
+- LM Studio（または互換性のあるLLM API）
+- 実行中のLLMモデル（推奨: qwen3-coder-30b）
+
+## インストール
+
+### Dockerイメージのビルド
+
+```bash
+docker build -t llm-code-reviewer .
+```
+
+## 使用方法
+
+### 基本的な使い方
+
+```bash
+docker run -v /path/to/your/code:/code llm-code-reviewer
+```
+
+### カスタム設定での使用
+
+```bash
+docker run -v /path/to/your/code:/code llm-code-reviewer \
+  --api-url http://192.168.50.136:1234/v1 \
+  --model qwen/qwen3-coder-30b \
+  --context-length 262144 \
+  --output /code/review-results.json
+```
+
+### レビュー焦点のカスタマイズ
+
+```bash
+# セキュリティとパフォーマンスに焦点を当てたレビュー
+docker run -v /path/to/your/code:/code llm-code-reviewer \
+  --review-focus security \
+  --review-focus performance
+
+# PEP8チェックを含む包括的なレビュー
+docker run -v /path/to/your/code:/code llm-code-reviewer \
+  --review-focus pep8 \
+  --review-focus bugs \
+  --review-focus maintainability
+```
+
+### カスタムシステムプロンプトの使用
+
+```bash
+# コマンドラインで直接指定
+docker run -v /path/to/your/code:/code llm-code-reviewer \
+  --system-prompt "あなたは20年の経験を持つシニアエンジニアです。厳格にレビューしてください。"
+
+# ファイルから読み込み
+docker run -v /path/to/your/code:/code \
+  -v /path/to/prompt.txt:/prompt.txt \
+  llm-code-reviewer \
+  --prompt-file /prompt.txt
+```
+
+### 英語でのレビュー
+
+```bash
+docker run -v /path/to/your/code:/code llm-code-reviewer \
+  --language en
+```
+
+### 除外パターンの指定
+
+```bash
+docker run -v /path/to/your/code:/code llm-code-reviewer \
+  --exclude "*.pyc" \
+  --exclude "build/*" \
+  --exclude "install/*"
+```
+
+## コマンドライン引数
+
+| 引数 | デフォルト値 | 説明 |
+|------|-------------|------|
+| `--api-url` | `http://192.168.50.136:1234/v1` | LLM APIのベースURL |
+| `--model` | `qwen/qwen3-coder-30b` | 使用するモデル名 |
+| `--context-length` | `262144` | モデルのコンテキスト長（トークン数） |
+| `--code-dir` | `/code` | レビュー対象のコードディレクトリ |
+| `--output` | `/code/review-results.json` | 結果の出力ファイルパス |
+| `--exclude` | （複数指定可） | 除外パターン（グロブ形式） |
+| `--review-focus` | `bugs, performance, maintainability` | レビューの焦点（複数指定可） |
+| `--language` | `ja` | 出力言語（`ja` または `en`） |
+| `--system-prompt` | - | カスタムシステムプロンプト |
+| `--prompt-file` | - | システムプロンプトを含むファイルのパス |
+
+### レビュー焦点のオプション
+
+| オプション | 説明 |
+|-----------|------|
+| `security` | セキュリティ脆弱性（SQLインジェクション、XSS、バッファオーバーフロー等） |
+| `performance` | パフォーマンスの問題（不要なループ、メモリリーク、非効率なアルゴリズム等） |
+| `pep8` | PEP8コーディング規約の違反（Pythonファイルのみ） |
+| `ros2` | ROS2固有の問題（ノードの設計、トピック/サービスの使用方法等） |
+| `bugs` | 潜在的なバグとロジックエラー |
+| `maintainability` | 保守性（コードの可読性、複雑度、ドキュメンテーション等） |
+| `general` | 一般的なコード品質の問題 |
+
+## 出力形式
+
+結果はJSON形式で出力されます：
+
+```json
+{
+  "total_files": 10,
+  "files_with_issues": 3,
+  "results": [
+    {
+      "file": "src/example.py",
+      "reviews": [
+        {
+          "line": 42,
+          "severity": "warning",
+          "message": "潜在的なnullポインタ参照の可能性があります。line 42の変数がNoneでないことを確認してください。"
+        },
+        {
+          "line": 15,
+          "severity": "info",
+          "message": "PEP8: 関数名は小文字とアンダースコアを使用してください（myFunction → my_function）"
+        }
+      ]
+    }
+  ]
+}
+```
+
+## サポートされるファイル形式
+
+- Python (`.py`)
+- C++ (`.cpp`, `.cc`, `.cxx`, `.hpp`, `.h`)
+- C (`.c`, `.h`)
+- ROS2 Launch (`.launch`)
+- YAML (`.yaml`, `.yml`)
+- XML (`.xml`)
+
+## デフォルトの除外パターン
+
+以下のパターンはデフォルトで除外されます：
+
+- `*.pyc`, `*.pyo`
+- `__pycache__/*`
+- `.svn/*`, `.git/*`
+- `build/*`, `install/*`, `log/*`
+
+## LM Studioの設定
+
+1. LM Studioを起動
+2. モデルをロード（推奨：qwen3-coder-30b）
+3. ローカルサーバーを起動
+4. サーバーのIPアドレスとポートを確認（例：`http://192.168.50.136:1234`）
+5. このツールから接続
+
+## 使用例
+
+### 基本的なレビュー
+
+```bash
+docker run -v ~/my-ros2-project:/code llm-code-reviewer
+```
+
+### セキュリティとPEP8に焦点を当てたレビュー
+
+```bash
+docker run -v ~/my-ros2-project:/code llm-code-reviewer \
+  --review-focus security \
+  --review-focus pep8
+```
+
+### カスタムプロンプトでの厳格なレビュー
+
+```bash
+docker run -v ~/my-ros2-project:/code llm-code-reviewer \
+  --system-prompt "あなたは経験豊富なROS2エンジニアです。バグ、セキュリティ問題、パフォーマンスの問題を見逃さず、厳格にレビューしてください。" \
+  --review-focus security \
+  --review-focus performance \
+  --review-focus ros2
+```
+
+## トラブルシューティング
+
+### API接続エラー
+
+LM Studioが起動していることと、指定したURLが正しいことを確認してください。また、ネットワーク設定でポートがブロックされていないか確認してください。
+
+### タイムアウトエラー
+
+大きなファイルや複雑なコードの場合、レビューに時間がかかることがあります。`reviewer.py`内のタイムアウト設定を調整できます。
+
+### メモリ不足
+
+大規模プロジェクトの場合、十分なGPUメモリが必要です。qwen3-coder-30bモデルには大容量のGPUメモリ（推奨128GB以上）が必要です。
+
+### 日本語出力が文字化けする
+
+Docker環境のロケール設定を確認してください。UTF-8がサポートされていることを確認してください。
+
+## 貢献
+
+プルリクエストを歓迎します。大きな変更の場合は、まずissueを開いて変更内容を議論してください。
+
+## ライセンス
+
+MIT License
+
+## 作者
+
+Devin AI (@y1618)
