@@ -15,6 +15,7 @@
 - 🚫 除外パターンのサポート（SVNリポジトリ対応）
 - 📈 リアルタイム進捗表示（パーセント表示）
 - 🔗 ファイルバッチング：小さいファイルを自動的にグループ化して、ファイル間の依存関係を考慮したレビュー
+- 📚 リポジトリ概要の共有：他ファイルの概要をプロンプトに含め、断片的なレビューを防止
 
 ## 必要要件
 
@@ -45,7 +46,9 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
   --api-url http://192.168.50.136:1234/v1 \
   --model qwen/qwen3-coder-30b \
   --context-length 262144 \
-  --output /code/review-results.json
+  --output /code/review-results.json \
+  --repo-overview-tokens 1500 \
+  --repo-overview-lines 25
 ```
 
 ### レビュー焦点のカスタマイズ
@@ -124,6 +127,18 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
   --batch-threshold 5000
 ```
 
+### リポジトリ概要を活用したクロスファイルレビュー
+
+リポジトリ内の主要ファイルや定義をプロンプトへ共有し、LLMが断片ではなくプロジェクト全体を踏まえてレビューできるようになりました。
+
+```bash
+docker run -v /path/to/your/code:/code llm-code-reviewer \
+  --repo-overview-tokens 2000 \
+  --repo-overview-lines 30
+```
+
+`--repo-overview-tokens` ではプロンプトに割り当てる最大トークン数を、`--repo-overview-lines` ではファイルごとの抜粋行数を制御できます。プロジェクトが大きい場合は適宜値を調整してください。
+
 ## コマンドライン引数
 
 | 引数 | デフォルト値 | 説明 |
@@ -141,6 +156,8 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
 | `--api-key` | - | API認証キー（OpenWebUI等で必要な場合） |
 | `--debug` | `False` | デバッグモードを有効化（詳細なログ出力） |
 | `--batch-threshold` | `10000` | バッチ処理の閾値（トークン数）。この値より小さいファイルはまとめてレビュー |
+| `--repo-overview-tokens` | `0` | 各レビューリクエストに添付するリポジトリ概要の最大トークン数（0で無効） |
+| `--repo-overview-lines` | `20` | 概要に含める各ファイルの抜粋最大行数 |
 
 ### レビュー焦点のオプション
 
