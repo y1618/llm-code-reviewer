@@ -27,7 +27,9 @@ class CodeReviewer:
         system_prompt: Optional[str] = None,
         api_key: Optional[str] = None,
         debug: bool = False,
-        batch_threshold: int = 10000
+        batch_threshold: int = 10000,
+        repo_overview_tokens: int = 0,
+        repo_overview_lines: int = 20
     ):
         self.api_url = api_url.rstrip('/')
         self.model = model
@@ -41,7 +43,10 @@ class CodeReviewer:
         self.api_key = api_key
         self.debug = debug
         self.batch_threshold = batch_threshold
+        self.repo_overview_tokens = repo_overview_tokens
+        self.repo_overview_lines = repo_overview_lines
         self.results = []
+        self.repo_overview_entries: List[Dict[str, Any]] = []
         
         self.supported_extensions = {
             '.py': 'Python',
@@ -109,6 +114,101 @@ class CodeReviewer:
                 if file_path.is_file() and not self.should_exclude(file_path):
                     files.append(file_path)
         return sorted(files)
+
+    def build_repo_overview(self, files: List[Path]):
+        if self.repo_overview_tokens <= 0:
+            return
+
+        overview_entries = []
+
+        for file_path in files:
+            try:
+                content = file_path.read_text(encoding='utf-8')
+            except Exception:
+                continue
+
+            summary_lines = self.summarize_file_for_overview(file_path, content)
+            if not summary_lines:
+                continue
+
+            relative_path = file_path.relative_to(self.code_dir)
+            language = self.supported_extensions.get(file_path.suffix, 'Unknown')
+            entry_text = (
+                f"File: {relative_path}\n"
+                f"Language: {language}\n"
+                "Summary:\n"
+                + "\n".join(summary_lines)
+            )
+
+            overview_entries.append({
+                'path': file_path,
+                'text': entry_text,
+                'tokens': self.estimate_tokens(entry_text)
+            })
+
+        overview_entries.sort(key=lambda x: str(x['path']))
+        self.repo_overview_entries = overview_entries
+
+        if self.debug and self.repo_overview_entries:
+            total_tokens = sum(e['tokens'] for e in self.repo_overview_entries)
+            print(
+                f"[DEBUG] プロジェクト概要エントリ数: {len(self.repo_overview_entries)} (推定トークン: {total_tokens})",
+                file=sys.stderr
+            )
+
+    def summarize_file_for_overview(self, file_path: Path, content: str) -> List[str]:
+        lines = content.split('\n')
+        summary_lines: List[str] = []
+        max_lines = max(1, self.repo_overview_lines)
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            if file_path.suffix == '.py':
+                if stripped.startswith(('class ', 'def ', '@')):
+                    summary_lines.append(stripped)
+                elif len(summary_lines) < 3:
+                    summary_lines.append(stripped)
+            else:
+                summary_lines.append(stripped)
+
+            if len(summary_lines) >= max_lines:
+                break
+
+        if not summary_lines:
+            summary_lines = lines[:max_lines]
+
+        return summary_lines
+
+    def get_repo_overview_context(self, exclude_paths: Optional[List[Path]] = None) -> str:
+        if self.repo_overview_tokens <= 0 or not self.repo_overview_entries:
+            return ""
+
+        exclude_set = {p.resolve() for p in exclude_paths} if exclude_paths else set()
+        collected = []
+        total_tokens = 0
+
+        for entry in self.repo_overview_entries:
+            if entry['path'].resolve() in exclude_set:
+                continue
+
+            if total_tokens + entry['tokens'] > self.repo_overview_tokens:
+                break
+
+            collected.append(entry['text'])
+            total_tokens += entry['tokens']
+
+        if not collected:
+            return ""
+
+        if self.language == 'ja':
+            header = "プロジェクト全体の概要:\n"
+        else:
+            header = "Repository overview:\n"
+
+        return header + "\n\n".join(collected)
     
     def batch_files(self, files: List[Path]) -> List[List[Path]]:
         batches = []
@@ -218,7 +318,8 @@ class CodeReviewer:
     
     def generate_review_prompt(self, file_path: Path, content: str, chunk_info: Optional[Dict] = None) -> str:
         language = self.supported_extensions.get(file_path.suffix, 'Unknown')
-        
+        repo_overview = self.get_repo_overview_context([file_path])
+
         if self.language == 'ja':
             prompt = f"""あなたは{language}とROS2開発に精通したエキスパートコードレビュアーです。
 以下のコードをレビューし、具体的で実行可能なフィードバックを提供してください。
@@ -233,7 +334,10 @@ Review the following code and provide specific, actionable feedback.
 File: {file_path.relative_to(self.code_dir)}
 Language: {language}
 """
-        
+
+        if repo_overview:
+            prompt += f"\n{repo_overview}\n"
+
         if chunk_info:
             if self.language == 'ja':
                 prompt += f"行: {chunk_info['start_line']}-{chunk_info['end_line']}\n"
@@ -383,7 +487,9 @@ Be specific about line numbers and provide clear, actionable feedback."""
         if len(file_paths) == 1:
             self.review_file(file_paths[0])
             return
-        
+
+        repo_overview = self.get_repo_overview_context(file_paths)
+
         if self.language == 'ja':
             combined_content = f"複数の関連ファイルをレビューします（{len(file_paths)}ファイル）:\n\n"
         else:
@@ -415,6 +521,8 @@ Be specific about line numbers and provide clear, actionable feedback."""
 
 {focus_instructions}
 
+{repo_overview}
+
 {combined_content}
 
 各ファイルごとに問題点を JSON 形式で返してください:
@@ -427,6 +535,8 @@ Be specific about line numbers and provide clear, actionable feedback."""
 Review the following related files together, considering cross-file dependencies and interactions.
 
 {focus_instructions}
+
+{repo_overview}
 
 {combined_content}
 
@@ -457,7 +567,9 @@ For multiple files, return an array: [{{"file": "...", "reviews": [...]}}, ...]
         files = self.find_files()
         total_files = len(files)
         print(f"{total_files}個のファイルが見つかりました")
-        
+
+        self.build_repo_overview(files)
+
         batches = self.batch_files(files)
         total_batches = len(batches)
         
@@ -569,6 +681,18 @@ def main():
         default=10000,
         help='ファイルをバッチ処理する閾値（トークン数）。この値より小さいファイルはまとめてレビューされます (デフォルト: 10000)'
     )
+    parser.add_argument(
+        '--repo-overview-tokens',
+        type=int,
+        default=0,
+        help='各レビューリクエストに含めるリポジトリ概要の最大トークン数。0を指定すると無効化 (デフォルト: 0)'
+    )
+    parser.add_argument(
+        '--repo-overview-lines',
+        type=int,
+        default=20,
+        help='リポジトリ概要の各ファイルで抜粋する最大行数 (デフォルト: 20)'
+    )
     
     args = parser.parse_args()
     
@@ -608,7 +732,9 @@ def main():
         system_prompt=system_prompt,
         api_key=args.api_key,
         debug=args.debug,
-        batch_threshold=args.batch_threshold
+        batch_threshold=args.batch_threshold,
+        repo_overview_tokens=args.repo_overview_tokens,
+        repo_overview_lines=args.repo_overview_lines
     )
     
     reviewer.run()
