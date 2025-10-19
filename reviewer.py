@@ -1,16 +1,37 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
-import os
+import subprocess
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, TypedDict
 import requests
 import fnmatch
+
+try:
+    from langgraph.graph import END, StateGraph
+except ImportError as exc:
+    raise ImportError(
+        "LangGraph is required to run this reviewer. Install it with 'pip install langgraph'."
+    ) from exc
+
+from chunker import Chunk, generate_chunks
+from coverage import CoverageLedger, CoverageTarget
 
 MAX_FILES_PER_BATCH = 5  # Maximum number of files to batch together
 BATCH_TOKEN_RATIO = 0.3  # Use 30% of context length for batch content (leaving room for prompt overhead)
 API_TIMEOUT_SECONDS = 300  # 5 minutes timeout for LLM API calls
+
+
+class ReviewerState(TypedDict, total=False):
+    files: List[Path]
+    total_files: int
+    batches: List[List[Path]]
+    total_batches: int
+    processed_files: int
+    results: List[Dict[str, Any]]
+    repo_overview_entries: List[Dict[str, Any]]
 
 
 class CodeReviewer:
@@ -27,7 +48,10 @@ class CodeReviewer:
         system_prompt: Optional[str] = None,
         api_key: Optional[str] = None,
         debug: bool = False,
-        batch_threshold: int = 10000
+        batch_threshold: int = 10000,
+        repo_overview_tokens: int = 0,
+        repo_overview_lines: int = 20,
+        fail_on_miss: bool = False,
     ):
         self.api_url = api_url.rstrip('/')
         self.model = model
@@ -41,7 +65,14 @@ class CodeReviewer:
         self.api_key = api_key
         self.debug = debug
         self.batch_threshold = batch_threshold
+        self.repo_overview_tokens = repo_overview_tokens
+        self.repo_overview_lines = repo_overview_lines
+        self.fail_on_miss = fail_on_miss
         self.results = []
+        self.repo_overview_entries: List[Dict[str, Any]] = []
+        self.commit_sha = self._resolve_commit_sha()
+        self.coverage = CoverageLedger(self.code_dir, self.commit_sha)
+        self.batch_counter = 0
         
         self.supported_extensions = {
             '.py': 'Python',
@@ -88,27 +119,138 @@ class CodeReviewer:
             }
         }
         
-    def should_exclude(self, file_path: Path) -> bool:
+    def should_exclude(self, file_path: Path) -> Optional[str]:
         relative_path = str(file_path.relative_to(self.code_dir))
-        
+
         for pattern in self.exclude_patterns:
             if fnmatch.fnmatch(relative_path, pattern) or fnmatch.fnmatch(file_path.name, pattern):
-                return True
-        
+                return f"excluded by pattern '{pattern}'"
+
         exclude_dirs = ['.git', '.svn', '__pycache__', 'node_modules', 'build', 'install', 'log']
         for part in file_path.parts:
             if part in exclude_dirs:
-                return True
-                
-        return False
+                return f"excluded directory '{part}'"
+
+        return None
     
     def find_files(self) -> List[Path]:
         files = []
         for ext in self.supported_extensions.keys():
             for file_path in self.code_dir.rglob(f'*{ext}'):
-                if file_path.is_file() and not self.should_exclude(file_path):
-                    files.append(file_path)
+                if not file_path.is_file():
+                    continue
+                reason = self.should_exclude(file_path)
+                if reason:
+                    relative_path = str(file_path.relative_to(self.code_dir))
+                    self.coverage.record_skip(relative_path, reason)
+                    continue
+                files.append(file_path)
         return sorted(files)
+
+    def build_repo_overview(self, files: List[Path]):
+        if self.repo_overview_tokens <= 0:
+            return
+
+        overview_entries = []
+
+        for file_path in files:
+            try:
+                content = file_path.read_text(encoding='utf-8')
+            except Exception:
+                continue
+
+            summary_lines = self.summarize_file_for_overview(file_path, content)
+            if not summary_lines:
+                continue
+
+            relative_path = file_path.relative_to(self.code_dir)
+            language = self.supported_extensions.get(file_path.suffix, 'Unknown')
+            entry_text = (
+                f"File: {relative_path}\n"
+                f"Language: {language}\n"
+                "Summary:\n"
+                + "\n".join(summary_lines)
+            )
+
+            overview_entries.append({
+                'path': file_path,
+                'text': entry_text,
+                'tokens': self.estimate_tokens(entry_text)
+            })
+
+        overview_entries.sort(key=lambda x: str(x['path']))
+        self.repo_overview_entries = overview_entries
+
+        if self.debug and self.repo_overview_entries:
+            total_tokens = sum(e['tokens'] for e in self.repo_overview_entries)
+            print(
+                f"[DEBUG] プロジェクト概要エントリ数: {len(self.repo_overview_entries)} (推定トークン: {total_tokens})",
+                file=sys.stderr
+            )
+
+    def summarize_file_for_overview(self, file_path: Path, content: str) -> List[str]:
+        lines = content.split('\n')
+        summary_lines: List[str] = []
+        max_lines = max(1, self.repo_overview_lines)
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            if file_path.suffix == '.py':
+                if stripped.startswith(('class ', 'def ', '@')):
+                    summary_lines.append(stripped)
+                elif len(summary_lines) < 3:
+                    summary_lines.append(stripped)
+            else:
+                summary_lines.append(stripped)
+
+            if len(summary_lines) >= max_lines:
+                break
+
+        if not summary_lines:
+            summary_lines = lines[:max_lines]
+
+        return summary_lines
+
+    def get_repo_overview_context(
+        self,
+        exclude_paths: Optional[List[Path]] = None,
+        repo_overview_entries: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        entries = (
+            repo_overview_entries
+            if repo_overview_entries is not None
+            else self.repo_overview_entries
+        )
+
+        if self.repo_overview_tokens <= 0 or not entries:
+            return ""
+
+        exclude_set = {p.resolve() for p in exclude_paths} if exclude_paths else set()
+        collected = []
+        total_tokens = 0
+
+        for entry in entries:
+            if entry['path'].resolve() in exclude_set:
+                continue
+
+            if total_tokens + entry['tokens'] > self.repo_overview_tokens:
+                break
+
+            collected.append(entry['text'])
+            total_tokens += entry['tokens']
+
+        if not collected:
+            return ""
+
+        if self.language == 'ja':
+            header = "プロジェクト全体の概要:\n"
+        else:
+            header = "Repository overview:\n"
+
+        return header + "\n\n".join(collected)
     
     def batch_files(self, files: List[Path]) -> List[List[Path]]:
         batches = []
@@ -167,40 +309,34 @@ class CodeReviewer:
     
     def estimate_tokens(self, text: str) -> int:
         return len(text) // 4
+
+    def _resolve_commit_sha(self) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.code_dir,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.strip() or None
+        except Exception as exc:
+            if self.debug:
+                print(f"[DEBUG] コミットSHAの取得に失敗: {exc}", file=sys.stderr)
+            return None
+
+    def _next_batch_id(self) -> int:
+        self.batch_counter += 1
+        return self.batch_counter
     
-    def split_file_content(self, content: str, file_path: Path) -> List[Dict[str, Any]]:
-        chunks = []
-        lines = content.split('\n')
-        
-        max_chunk_tokens = self.context_length // 2
-        current_chunk = []
-        current_start_line = 1
-        current_tokens = 0
-        
-        for i, line in enumerate(lines, 1):
-            line_tokens = self.estimate_tokens(line)
-            
-            if current_tokens + line_tokens > max_chunk_tokens and current_chunk:
-                chunks.append({
-                    'content': '\n'.join(current_chunk),
-                    'start_line': current_start_line,
-                    'end_line': i - 1
-                })
-                current_chunk = []
-                current_start_line = i
-                current_tokens = 0
-            
-            current_chunk.append(line)
-            current_tokens += line_tokens
-        
-        if current_chunk:
-            chunks.append({
-                'content': '\n'.join(current_chunk),
-                'start_line': current_start_line,
-                'end_line': len(lines)
-            })
-        
-        return chunks
+    def split_file_content(self, content: str, file_path: Path) -> List[Chunk]:
+        relative_path = str(file_path.relative_to(self.code_dir))
+        return generate_chunks(
+            content=content,
+            file_path=file_path,
+            relative_path=relative_path,
+            context_length=self.context_length,
+        )
     
     def get_focus_instructions(self) -> str:
         if self.language == 'ja':
@@ -213,12 +349,53 @@ class CodeReviewer:
             for focus in self.review_focus:
                 if focus in self.focus_descriptions:
                     instructions += f"- {self.focus_descriptions[focus]['en']}\n"
-        
+
         return instructions
-    
-    def generate_review_prompt(self, file_path: Path, content: str, chunk_info: Optional[Dict] = None) -> str:
+
+    def normalize_review_entry(self, review: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(review)
+        risk_score = normalized.get('risk_score')
+
+        try:
+            risk_int = int(risk_score)
+        except (TypeError, ValueError):
+            risk_int = None
+
+        if risk_int is None or not 1 <= risk_int <= 10:
+            if self.debug:
+                print(
+                    f"[DEBUG] 無効なrisk_scoreを検出したため補正します: {risk_score}",
+                    file=sys.stderr
+                )
+            risk_int = 5
+
+        normalized['risk_score'] = risk_int
+        return normalized
+
+    def normalize_reviews(self, reviews: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [self.normalize_review_entry(review) for review in reviews]
+
+    def append_result(self, file_identifier: str, reviews: List[Dict[str, Any]]):
+        normalized_identifier = str(file_identifier)
+        normalized_reviews = self.normalize_reviews(reviews)
+        if normalized_reviews:
+            self.results.append({
+                'file': normalized_identifier,
+                'reviews': normalized_reviews
+            })
+
+    def generate_review_prompt(
+        self,
+        file_path: Path,
+        content: str,
+        chunk_info: Optional[Dict] = None,
+        repo_overview_entries: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         language = self.supported_extensions.get(file_path.suffix, 'Unknown')
-        
+        repo_overview = self.get_repo_overview_context(
+            [file_path], repo_overview_entries=repo_overview_entries
+        )
+
         if self.language == 'ja':
             prompt = f"""あなたは{language}とROS2開発に精通したエキスパートコードレビュアーです。
 以下のコードをレビューし、具体的で実行可能なフィードバックを提供してください。
@@ -233,12 +410,21 @@ Review the following code and provide specific, actionable feedback.
 File: {file_path.relative_to(self.code_dir)}
 Language: {language}
 """
-        
+
+        if repo_overview:
+            prompt += f"\n{repo_overview}\n"
+
         if chunk_info:
-            if self.language == 'ja':
-                prompt += f"行: {chunk_info['start_line']}-{chunk_info['end_line']}\n"
-            else:
-                prompt += f"Lines: {chunk_info['start_line']}-{chunk_info['end_line']}\n"
+            start_line = getattr(chunk_info, 'start_line', None)
+            end_line = getattr(chunk_info, 'end_line', None)
+            chunk_id = getattr(chunk_info, 'chunk_id', None)
+            if start_line is not None and end_line is not None:
+                if self.language == 'ja':
+                    prompt += f"行: {start_line}-{end_line}\n"
+                else:
+                    prompt += f"Lines: {start_line}-{end_line}\n"
+            if chunk_id:
+                prompt += f"Chunk ID: {chunk_id}\n"
         
         prompt += f"""
 コード:
@@ -254,44 +440,54 @@ Language: {language}
             prompt += """以下の正確なJSON形式でのみ応答してください:
 {
   "reviews": [
-    {"line": <行番号>, "severity": "error|warning|info", "message": "詳細なメッセージ"},
+    {"line": <行番号>, "severity": "error|warning|info", "risk_score": <1から10の整数>, "message": "詳細なメッセージ"},
     ...
   ],
   "summary": "全体的な評価の簡潔な要約"
 }
 
+`risk_score` は 1 から 10 の整数で、10 は修正必須、1 は様子見で問題ないレベルを意味します。
 行番号を正確に指定し、明確で実行可能なフィードバックを提供してください。
 すべてのメッセージは日本語で記述してください。"""
         else:
             prompt += """Respond ONLY with a valid JSON object in this exact format:
 {
   "reviews": [
-    {"line": <line_number>, "severity": "error|warning|info", "message": "detailed message"},
+    {"line": <line_number>, "severity": "error|warning|info", "risk_score": <integer 1-10>, "message": "detailed message"},
     ...
   ],
   "summary": "brief overall assessment"
 }
 
+The `risk_score` must be an integer between 1 (safe to defer) and 10 (must fix immediately).
 Be specific about line numbers and provide clear, actionable feedback."""
         
         return prompt
     
-    def call_llm(self, prompt: str) -> Optional[Dict]:
+    def call_llm(self, prompt: str, ledger_files: List[Dict[str, object]]) -> Optional[Dict]:
+        system_message = self.system_prompt if self.system_prompt else (
+            "あなたは優秀なコードレビュアーです。" if self.language == 'ja'
+            else "You are an expert code reviewer."
+        )
+
+        headers = {}
+        if self.api_key:
+            headers['Authorization'] = f'Bearer {self.api_key}'
+
+        prompt_tokens = self.estimate_tokens(prompt)
+        prompt_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+        completion_tokens = 0
+        status = 'error'
+        error_message: Optional[str] = None
+
+        if self.debug:
+            print(f"[DEBUG] API URL: {self.api_url}/chat/completions", file=sys.stderr)
+            print(f"[DEBUG] Model: {self.model}", file=sys.stderr)
+            print(f"[DEBUG] プロンプト長: {prompt_tokens} トークン", file=sys.stderr)
+
+        parsed: Optional[Dict[str, Any]] = None
+
         try:
-            system_message = self.system_prompt if self.system_prompt else (
-                "あなたは優秀なコードレビュアーです。" if self.language == 'ja' 
-                else "You are an expert code reviewer."
-            )
-            
-            headers = {}
-            if self.api_key:
-                headers['Authorization'] = f'Bearer {self.api_key}'
-            
-            if self.debug:
-                print(f"[DEBUG] API URL: {self.api_url}/chat/completions", file=sys.stderr)
-                print(f"[DEBUG] Model: {self.model}", file=sys.stderr)
-                print(f"[DEBUG] プロンプト長: {self.estimate_tokens(prompt)} トークン", file=sys.stderr)
-            
             response = requests.post(
                 f"{self.api_url}/chat/completions",
                 json={
@@ -306,84 +502,135 @@ Be specific about line numbers and provide clear, actionable feedback."""
                 headers=headers,
                 timeout=API_TIMEOUT_SECONDS
             )
-            
+
             if self.debug:
                 print(f"[DEBUG] LLM応答ステータス: {response.status_code}", file=sys.stderr)
-            
-            if response.status_code == 200:
-                result = response.json()
-                content = result['choices'][0]['message']['content']
-                
-                if self.debug:
-                    print(f"[DEBUG] LLM応答プレビュー: {content[:200]}...", file=sys.stderr)
-                
-                content = content.strip()
-                if content.startswith('```json'):
-                    content = content[7:]
-                if content.startswith('```'):
-                    content = content[3:]
-                if content.endswith('```'):
-                    content = content[:-3]
-                content = content.strip()
-                
-                try:
-                    parsed = json.loads(content)
-                    if self.debug:
-                        print(f"[DEBUG] JSON解析成功", file=sys.stderr)
-                    return parsed
-                except json.JSONDecodeError as je:
-                    print(f"JSON解析エラー: {je}", file=sys.stderr)
-                    if self.debug:
-                        print(f"[DEBUG] 解析失敗した内容:\n{content[:500]}", file=sys.stderr)
-                    return None
-            else:
+
+            if response.status_code != 200:
+                error_message = f"status {response.status_code}: {response.text}"
                 print(f"エラー: APIがステータス {response.status_code} を返しました: {response.text}", file=sys.stderr)
                 return None
-                
-        except requests.exceptions.Timeout as e:
-            print(f"LLMタイムアウトエラー ({API_TIMEOUT_SECONDS}秒): {e}", file=sys.stderr)
-            return None
-        except json.JSONDecodeError as je:
-            print(f"JSON解析エラー: {je}", file=sys.stderr)
-            return None
-        except Exception as e:
-            print(f"LLM呼び出しエラー: {e}", file=sys.stderr)
+
+            result = response.json()
+            content = result['choices'][0]['message']['content']
+
+            if self.debug:
+                print(f"[DEBUG] LLM応答プレビュー: {content[:200]}...", file=sys.stderr)
+
+            completion_tokens = self.estimate_tokens(content)
+            content = content.strip()
+            if content.startswith('```json'):
+                content = content[7:]
+            if content.startswith('```'):
+                content = content[3:]
+            if content.endswith('```'):
+                content = content[:-3]
+            content = content.strip()
+
+            parsed = json.loads(content)
+            status = 'ok'
+            if self.debug:
+                print(f"[DEBUG] JSON解析成功", file=sys.stderr)
+            return parsed
+
+        except requests.exceptions.Timeout as exc:
+            status = 'timeout'
+            error_message = f"timeout: {exc}"
+            print(f"LLMタイムアウトエラー ({API_TIMEOUT_SECONDS}秒): {exc}", file=sys.stderr)
+        except json.JSONDecodeError as exc:
+            error_message = f"json decode: {exc}"
+            print(f"JSON解析エラー: {exc}", file=sys.stderr)
+            if self.debug and 'content' in locals():
+                print(f"[DEBUG] 解析失敗した内容:\n{content[:500]}", file=sys.stderr)
+        except Exception as exc:
+            error_message = str(exc)
+            print(f"LLM呼び出しエラー: {exc}", file=sys.stderr)
             if self.debug:
                 import traceback
                 traceback.print_exc(file=sys.stderr)
-            return None
+        finally:
+            self.coverage.append_record(
+                files=ledger_files,
+                model=self.model,
+                api_url=self.api_url,
+                max_context=self.context_length,
+                prompt_hash=prompt_hash,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                status=status,
+                error_message=error_message,
+            )
+
+        return parsed
     
-    def review_file(self, file_path: Path):
+    def review_file(
+        self,
+        file_path: Path,
+        repo_overview_entries: Optional[List[Dict[str, Any]]] = None,
+    ):
         try:
             content = file_path.read_text(encoding='utf-8')
         except Exception as e:
             print(f"{file_path}の読み込みエラー: {e}", file=sys.stderr)
+            relative_path = str(file_path.relative_to(self.code_dir))
+            self.coverage.record_skip(relative_path, f"read_error: {e}")
             return
         
         chunks = self.split_file_content(content, file_path)
+        relative_path = str(file_path.relative_to(self.code_dir))
+        chunk_targets = [
+            CoverageTarget(
+                path=relative_path,
+                sha256=chunk.sha256,
+                start_line=chunk.start_line,
+                end_line=chunk.end_line,
+                chunk_id=chunk.chunk_id,
+            )
+            for chunk in chunks
+        ]
+        self.coverage.register_targets(chunk_targets)
         file_reviews = []
-        
-        for chunk in chunks:
-            prompt = self.generate_review_prompt(file_path, chunk['content'], chunk)
-            result = self.call_llm(prompt)
-            
+
+        for chunk, target in zip(chunks, chunk_targets):
+            prompt = self.generate_review_prompt(
+                file_path,
+                chunk.content,
+                chunk,
+                repo_overview_entries=repo_overview_entries,
+            )
+            ledger_files = [
+                {
+                    'path': target.path,
+                    'sha256': target.sha256,
+                    'start_line': target.start_line,
+                    'end_line': target.end_line,
+                    'chunk_id': target.chunk_id,
+                }
+            ]
+            result = self.call_llm(prompt, ledger_files)
+
             if result and 'reviews' in result:
                 for review in result['reviews']:
-                    if chunk['start_line'] > 1:
-                        review['line'] += chunk['start_line'] - 1
+                    if chunk.start_line > 1 and isinstance(review.get('line'), int):
+                        review['line'] += chunk.start_line - 1
                     file_reviews.append(review)
-        
+
         if file_reviews:
-            self.results.append({
-                'file': str(file_path.relative_to(self.code_dir)),
-                'reviews': file_reviews
-            })
-    
-    def review_batch(self, file_paths: List[Path]):
+            self.append_result(str(file_path.relative_to(self.code_dir)), file_reviews)
+
+    def review_batch(
+        self,
+        file_paths: List[Path],
+        repo_overview_entries: Optional[List[Dict[str, Any]]] = None,
+    ):
         if len(file_paths) == 1:
-            self.review_file(file_paths[0])
+            self.review_file(file_paths[0], repo_overview_entries=repo_overview_entries)
             return
-        
+
+        repo_overview = self.get_repo_overview_context(
+            file_paths, repo_overview_entries=repo_overview_entries
+        )
+
         if self.language == 'ja':
             combined_content = f"複数の関連ファイルをレビューします（{len(file_paths)}ファイル）:\n\n"
         else:
@@ -393,18 +640,49 @@ Be specific about line numbers and provide clear, actionable feedback."""
         for file_path in file_paths:
             try:
                 content = file_path.read_text(encoding='utf-8')
-                relative_path = file_path.relative_to(self.code_dir)
+                relative_path = str(file_path.relative_to(self.code_dir))
+                file_sha = hashlib.sha256(content.encode('utf-8')).hexdigest()
+                line_count = len(content.splitlines())
+                if line_count == 0:
+                    line_count = 1
                 file_contents.append({
                     'path': file_path,
                     'relative_path': relative_path,
-                    'content': content
+                    'content': content,
+                    'sha256': file_sha,
+                    'line_count': line_count,
                 })
                 combined_content += f"--- File: {relative_path} ---\n{content}\n\n"
             except Exception as e:
                 print(f"{file_path}の読み込みエラー: {e}", file=sys.stderr)
-        
+                relative_path = str(file_path.relative_to(self.code_dir))
+                self.coverage.record_skip(relative_path, f"read_error: {e}")
+
         if not file_contents:
             return
+
+        batch_id = self._next_batch_id()
+        batch_targets = []
+        ledger_files = []
+        for idx, info in enumerate(file_contents):
+            chunk_id = f"{info['relative_path']}#{info['sha256']}@batch-{batch_id}-{idx}"
+            target = CoverageTarget(
+                path=info['relative_path'],
+                sha256=info['sha256'],
+                start_line=1,
+                end_line=info['line_count'],
+                chunk_id=chunk_id,
+            )
+            batch_targets.append(target)
+            ledger_files.append({
+                'path': target.path,
+                'sha256': target.sha256,
+                'start_line': target.start_line,
+                'end_line': target.end_line,
+                'chunk_id': target.chunk_id,
+            })
+
+        self.coverage.register_targets(batch_targets)
         
         language = self.supported_extensions.get(file_paths[0].suffix, 'Unknown')
         focus_instructions = self.get_focus_instructions()
@@ -415,12 +693,16 @@ Be specific about line numbers and provide clear, actionable feedback."""
 
 {focus_instructions}
 
+{repo_overview}
+
 {combined_content}
 
 各ファイルごとに問題点を JSON 形式で返してください:
-{{"file": "相対パス", "reviews": [{{"line": 行番号, "severity": "error/warning/info", "message": "指摘内容"}}]}}
+{{"file": "相対パス", "reviews": [{{"line": 行番号, "severity": "error/warning/info", "risk_score": <1から10の整数>, "message": "指摘内容"}}]}}
 
 複数ファイルがある場合は配列で返してください: [{{"file": "...", "reviews": [...]}}, ...]
+
+`risk_score` は 1 から 10 の整数で、10 は修正必須、1 は様子見で問題ないレベルを意味します。
 """
         else:
             prompt = f"""You are an expert code reviewer specializing in {language} and ROS2 development.
@@ -428,73 +710,164 @@ Review the following related files together, considering cross-file dependencies
 
 {focus_instructions}
 
+{repo_overview}
+
 {combined_content}
 
 Return issues in JSON format for each file:
-{{"file": "relative_path", "reviews": [{{"line": line_number, "severity": "error/warning/info", "message": "issue description"}}]}}
+{{"file": "relative_path", "reviews": [{{"line": line_number, "severity": "error/warning/info", "risk_score": <integer 1-10>, "message": "issue description"}}]}}
 
 For multiple files, return an array: [{{"file": "...", "reviews": [...]}}, ...]
+
+The `risk_score` must be an integer between 1 (safe to defer) and 10 (must fix immediately).
 """
         
-        result = self.call_llm(prompt)
-        
+        result = self.call_llm(prompt, ledger_files)
+
         if result:
             if isinstance(result, dict) and 'file' in result:
                 if result.get('reviews'):
-                    self.results.append(result)
+                    self.append_result(result['file'], result['reviews'])
             elif isinstance(result, list):
                 for file_result in result:
-                    if file_result.get('reviews'):
-                        self.results.append(file_result)
+                    if file_result.get('reviews') and 'file' in file_result:
+                        self.append_result(file_result['file'], file_result['reviews'])
             elif isinstance(result, dict) and 'reviews' in result:
                 if result.get('reviews'):
-                    self.results.append({
-                        'file': str(file_paths[0].relative_to(self.code_dir)),
-                        'reviews': result['reviews']
-                    })
+                    self.append_result(
+                        str(file_paths[0].relative_to(self.code_dir)),
+                        result['reviews']
+                    )
     
-    def run(self):
+    def build_graph(self):
+        graph = StateGraph(ReviewerState)
+
+        graph.add_node("collect_files", self._collect_files_node)
+        graph.add_node("build_overview", self._build_overview_node)
+        graph.add_node("create_batches", self._create_batches_node)
+        graph.add_node("review_batches", self._review_batches_node)
+        graph.add_node("finalize", self._finalize_node)
+
+        graph.set_entry_point("collect_files")
+        graph.add_edge("collect_files", "build_overview")
+        graph.add_edge("build_overview", "create_batches")
+        graph.add_edge("create_batches", "review_batches")
+        graph.add_edge("review_batches", "finalize")
+        graph.add_edge("finalize", END)
+
+        return graph.compile()
+
+    def _collect_files_node(self, state: ReviewerState) -> ReviewerState:
         files = self.find_files()
         total_files = len(files)
         print(f"{total_files}個のファイルが見つかりました")
-        
+
+        self.results = []
+        updated_state: ReviewerState = dict(state)
+        updated_state.update({
+            'files': files,
+            'total_files': total_files,
+            'processed_files': 0,
+            'results': [],
+            'repo_overview_entries': [],
+        })
+        return updated_state
+
+    def _build_overview_node(self, state: ReviewerState) -> ReviewerState:
+        files = state.get('files', [])
+        self.build_repo_overview(files)
+
+        if self.debug and self.repo_overview_entries:
+            print(
+                f"[DEBUG] グラフ: プロジェクト概要を {len(self.repo_overview_entries)} 件生成", file=sys.stderr
+            )
+
+        updated_state: ReviewerState = dict(state)
+        updated_state['repo_overview_entries'] = self.repo_overview_entries
+        return updated_state
+
+    def _create_batches_node(self, state: ReviewerState) -> ReviewerState:
+        files = state.get('files', [])
         batches = self.batch_files(files)
         total_batches = len(batches)
-        
+
         if self.debug:
             print(f"[DEBUG] {total_batches}個のバッチを作成しました", file=sys.stderr)
             for i, batch in enumerate(batches, 1):
-                batch_tokens = sum(self.estimate_tokens(f.read_text(encoding='utf-8', errors='ignore')) for f in batch)
-                print(f"[DEBUG] バッチ {i}: {len(batch)}ファイル, 約{batch_tokens}トークン", file=sys.stderr)
-        
-        processed_files = 0
+                batch_tokens = sum(
+                    self.estimate_tokens(f.read_text(encoding='utf-8', errors='ignore'))
+                    for f in batch
+                )
+                print(
+                    f"[DEBUG] バッチ {i}: {len(batch)}ファイル, 約{batch_tokens}トークン",
+                    file=sys.stderr,
+                )
+
+        updated_state: ReviewerState = dict(state)
+        updated_state.update({'batches': batches, 'total_batches': total_batches})
+        return updated_state
+
+    def _review_batches_node(self, state: ReviewerState) -> ReviewerState:
+        batches = state.get('batches', [])
+        total_files = state.get('total_files', 0)
+        total_batches = state.get('total_batches', len(batches))
+        processed_files = state.get('processed_files', 0)
+        repo_overview_entries = state.get('repo_overview_entries', self.repo_overview_entries)
+
         for batch_idx, batch in enumerate(batches, 1):
-            batch_progress = (batch_idx / total_batches) * 100
-            file_progress = (processed_files / total_files) * 100
-            
+            batch_progress = (batch_idx / max(total_batches, 1)) * 100
+            file_progress = (processed_files / max(total_files, 1)) * 100
+
             if len(batch) == 1:
-                print(f"\n[{processed_files + 1}/{total_files} ({file_progress:.1f}%)] レビュー中: {batch[0].relative_to(self.code_dir)}")
+                print(
+                    f"\n[{processed_files + 1}/{total_files} ({file_progress:.1f}%)] レビュー中: {batch[0].relative_to(self.code_dir)}"
+                )
             else:
-                print(f"\n[バッチ {batch_idx}/{total_batches} ({batch_progress:.1f}%)] {len(batch)}ファイルをまとめてレビュー中:")
+                print(
+                    f"\n[バッチ {batch_idx}/{total_batches} ({batch_progress:.1f}%)] {len(batch)}ファイルをまとめてレビュー中:"
+                )
                 for f in batch:
                     print(f"  - {f.relative_to(self.code_dir)}")
-            
-            self.review_batch(batch)
+
+            self.review_batch(batch, repo_overview_entries=repo_overview_entries)
             processed_files += len(batch)
-        
+
+        updated_state: ReviewerState = dict(state)
+        updated_state.update({'processed_files': processed_files, 'results': self.results})
+        return updated_state
+
+    def _finalize_node(self, state: ReviewerState) -> ReviewerState:
+        total_files = state.get('total_files', 0)
+        total_batches = state.get('total_batches', 0)
+
         output = {
             'total_files': total_files,
             'files_with_issues': len(self.results),
-            'results': self.results
+            'results': self.results,
         }
-        
+
         with open(self.output_path, 'w', encoding='utf-8') as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
-        
+
         print(f"\n✓ レビュー完了。結果を保存しました: {self.output_path}")
         print(f"  レビューしたファイル数: {total_files}")
         print(f"  バッチ数: {total_batches}")
         print(f"  問題が見つかったファイル数: {len(self.results)}")
+
+        report = self.coverage.build_report(self.results)
+        print(
+            f"  カバレッジ: {report['covered_segments']}/{report['total_segments']} セグメント"
+        )
+        if report['missed_segments'] > 0:
+            print("  未レビューセグメントが残っています。詳細: coverage/report.md", file=sys.stderr)
+            if self.fail_on_miss:
+                raise SystemExit(2)
+
+        return state
+
+    def run(self):
+        graph = self.build_graph()
+        return graph.invoke({})
 
 
 def main():
@@ -569,6 +942,23 @@ def main():
         default=10000,
         help='ファイルをバッチ処理する閾値（トークン数）。この値より小さいファイルはまとめてレビューされます (デフォルト: 10000)'
     )
+    parser.add_argument(
+        '--repo-overview-tokens',
+        type=int,
+        default=0,
+        help='各レビューリクエストに含めるリポジトリ概要の最大トークン数。0を指定すると無効化 (デフォルト: 0)'
+    )
+    parser.add_argument(
+        '--repo-overview-lines',
+        type=int,
+        default=20,
+        help='リポジトリ概要の各ファイルで抜粋する最大行数 (デフォルト: 20)'
+    )
+    parser.add_argument(
+        '--fail-on-miss',
+        action='store_true',
+        help='未レビューのセグメントが存在する場合に非ゼロ終了コードで停止する'
+    )
     
     args = parser.parse_args()
     
@@ -608,7 +998,10 @@ def main():
         system_prompt=system_prompt,
         api_key=args.api_key,
         debug=args.debug,
-        batch_threshold=args.batch_threshold
+        batch_threshold=args.batch_threshold,
+        repo_overview_tokens=args.repo_overview_tokens,
+        repo_overview_lines=args.repo_overview_lines,
+        fail_on_miss=args.fail_on_miss,
     )
     
     reviewer.run()
