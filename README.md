@@ -15,6 +15,10 @@
 - 🚫 除外パターンのサポート（SVNリポジトリ対応）
 - 📈 リアルタイム進捗表示（パーセント表示）
 - 🔗 ファイルバッチング：小さいファイルを自動的にグループ化して、ファイル間の依存関係を考慮したレビュー
+- 📚 リポジトリ概要の共有：他ファイルの概要をプロンプトに含め、断片的なレビューを防止
+- 🧠 LangGraphによるレビュー・フロー制御：ファイル収集から結果出力までをグラフで管理し、全体文脈を維持
+- 🗂️ Coverage Ledger とレポート：各レビューリクエストの対象チャンクを JSONL で記録し、未レビューの漏れを可視化
+- 🪢 行数ベースの決定的チャンク分割：チャンク ID と行番号を安定化し、差分レビューや再実行時の再現性を向上
 
 ## 必要要件
 
@@ -45,7 +49,9 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
   --api-url http://192.168.50.136:1234/v1 \
   --model qwen/qwen3-coder-30b \
   --context-length 262144 \
-  --output /code/review-results.json
+  --output /code/review-results.json \
+  --repo-overview-tokens 1500 \
+  --repo-overview-lines 25
 ```
 
 ### レビュー焦点のカスタマイズ
@@ -124,6 +130,44 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
   --batch-threshold 5000
 ```
 
+### リポジトリ概要を活用したクロスファイルレビュー
+
+リポジトリ内の主要ファイルや定義をプロンプトへ共有し、LLMが断片ではなくプロジェクト全体を踏まえてレビューできるようになりました。
+
+```bash
+docker run -v /path/to/your/code:/code llm-code-reviewer \
+  --repo-overview-tokens 2000 \
+  --repo-overview-lines 30
+```
+
+`--repo-overview-tokens` ではプロンプトに割り当てる最大トークン数を、`--repo-overview-lines` ではファイルごとの抜粋行数を制御できます。プロジェクトが大きい場合は適宜値を調整してください。
+
+### LangGraphによるレビュー・オーケストレーション
+
+本ツールでは [LangGraph](https://github.com/langchain-ai/langgraph) を使って、以下のステップを明示的なノードとして制御しています。
+
+1. **ファイル収集**：対象ファイルを検出してスコープを確定。
+2. **概要生成**：リポジトリ全体の要約を構築し、レビュー時に常に共有。
+3. **バッチ作成**：LangGraphの状態にバッチ情報を保持し、クロスファイルレビューを最適化。
+4. **レビュー実行**：各バッチに対して概要とコンテキストを付与しながらレビュー。
+5. **結果出力**：最終ノードでJSON出力と進捗レポートを完結。
+
+LangGraphを採用したことで、ワークフローがグラフとして可視化可能になり、処理の一部を差し替えたり、追加の検証ステップを挿入する拡張が容易になりました。
+
+リポジトリ概要はLangGraphの状態として保持されるため、すべてのレビュー・ノードが同じプロジェクトコンテキストを参照しながら指摘内容を判断できます。
+
+### Coverage Ledger とレポート
+
+レビューした内容を客観的に追跡するために、各 API コールごとに `coverage/ledger.jsonl` へ JSON レコードを追記します。レコードには以下が含まれます。
+
+- 参照したコミット SHA（取得できた場合）
+- モデル名・API URL・プロンプトハッシュ・概算トークン数
+- 対象となったファイルチャンク（`path`, `sha256`, `start_line`, `end_line`, `chunk_id`）とステータス（`ok` / `error`）
+
+処理完了時には LangGraph の最終ノードで `coverage/report.json` と `coverage/report.md` を生成し、登録済みチャンクのカバレッジ、ディレクトリ／ファイル単位の集計、未レビューのチャンク一覧を可視化します。バッジ形式の `coverage/badge.json` も出力され、CI などで利用できます。
+
+`--fail-on-miss` を指定すると、未レビューのチャンクが 1 つでも残っている場合に非ゼロ終了します。CI のゲートとして活用でき、漏れのないレビューを機械的に保証できます。
+
 ## コマンドライン引数
 
 | 引数 | デフォルト値 | 説明 |
@@ -141,6 +185,9 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
 | `--api-key` | - | API認証キー（OpenWebUI等で必要な場合） |
 | `--debug` | `False` | デバッグモードを有効化（詳細なログ出力） |
 | `--batch-threshold` | `10000` | バッチ処理の閾値（トークン数）。この値より小さいファイルはまとめてレビュー |
+| `--repo-overview-tokens` | `0` | 各レビューリクエストに添付するリポジトリ概要の最大トークン数（0で無効） |
+| `--repo-overview-lines` | `20` | 概要に含める各ファイルの抜粋最大行数 |
+| `--fail-on-miss` | `False` | 未レビューのチャンクが残っている場合に非ゼロ終了コードを返す |
 
 ### レビュー焦点のオプション
 
@@ -158,6 +205,8 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
 
 結果はJSON形式で出力されます：
 
+- `risk_score` は 1〜10 の整数で、不具合の危険度を表します（10: 修正必須、1: 様子見で問題なし）。
+
 ```json
 {
   "total_files": 10,
@@ -169,11 +218,13 @@ docker run -v /path/to/your/code:/code llm-code-reviewer \
         {
           "line": 42,
           "severity": "warning",
+          "risk_score": 7,
           "message": "潜在的なnullポインタ参照の可能性があります。line 42の変数がNoneでないことを確認してください。"
         },
         {
           "line": 15,
           "severity": "info",
+          "risk_score": 3,
           "message": "PEP8: 関数名は小文字とアンダースコアを使用してください（myFunction → my_function）"
         }
       ]
