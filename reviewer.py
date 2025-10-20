@@ -119,26 +119,32 @@ class CodeReviewer:
             }
         }
         
-    def should_exclude(self, file_path: Path) -> bool:
+    def should_exclude(self, file_path: Path) -> Optional[str]:
         relative_path = str(file_path.relative_to(self.code_dir))
-        
+
         for pattern in self.exclude_patterns:
             if fnmatch.fnmatch(relative_path, pattern) or fnmatch.fnmatch(file_path.name, pattern):
-                return True
-        
+                return f"excluded by pattern '{pattern}'"
+
         exclude_dirs = ['.git', '.svn', '__pycache__', 'node_modules', 'build', 'install', 'log']
         for part in file_path.parts:
             if part in exclude_dirs:
-                return True
-                
-        return False
+                return f"excluded directory '{part}'"
+
+        return None
     
     def find_files(self) -> List[Path]:
         files = []
         for ext in self.supported_extensions.keys():
             for file_path in self.code_dir.rglob(f'*{ext}'):
-                if file_path.is_file() and not self.should_exclude(file_path):
-                    files.append(file_path)
+                if not file_path.is_file():
+                    continue
+                reason = self.should_exclude(file_path)
+                if reason:
+                    relative_path = str(file_path.relative_to(self.code_dir))
+                    self.coverage.record_skip(relative_path, reason)
+                    continue
+                files.append(file_path)
         return sorted(files)
 
     def build_repo_overview(self, files: List[Path]):
@@ -528,6 +534,7 @@ Be specific about line numbers and provide clear, actionable feedback."""
             return parsed
 
         except requests.exceptions.Timeout as exc:
+            status = 'timeout'
             error_message = f"timeout: {exc}"
             print(f"LLMタイムアウトエラー ({API_TIMEOUT_SECONDS}秒): {exc}", file=sys.stderr)
         except json.JSONDecodeError as exc:
@@ -565,6 +572,8 @@ Be specific about line numbers and provide clear, actionable feedback."""
             content = file_path.read_text(encoding='utf-8')
         except Exception as e:
             print(f"{file_path}の読み込みエラー: {e}", file=sys.stderr)
+            relative_path = str(file_path.relative_to(self.code_dir))
+            self.coverage.record_skip(relative_path, f"read_error: {e}")
             return
         
         chunks = self.split_file_content(content, file_path)
@@ -646,6 +655,8 @@ Be specific about line numbers and provide clear, actionable feedback."""
                 combined_content += f"--- File: {relative_path} ---\n{content}\n\n"
             except Exception as e:
                 print(f"{file_path}の読み込みエラー: {e}", file=sys.stderr)
+                relative_path = str(file_path.relative_to(self.code_dir))
+                self.coverage.record_skip(relative_path, f"read_error: {e}")
 
         if not file_contents:
             return
@@ -843,7 +854,7 @@ The `risk_score` must be an integer between 1 (safe to defer) and 10 (must fix i
         print(f"  バッチ数: {total_batches}")
         print(f"  問題が見つかったファイル数: {len(self.results)}")
 
-        report = self.coverage.build_report()
+        report = self.coverage.build_report(self.results)
         print(
             f"  カバレッジ: {report['covered_segments']}/{report['total_segments']} セグメント"
         )

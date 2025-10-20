@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ class CoverageTarget:
     start_line: int
     end_line: int
     chunk_id: str
+    reason: Optional[str] = None
 
     def key(self) -> str:
         return f"{self.path}:{self.start_line}:{self.end_line}:{self.sha256}:{self.chunk_id}"
@@ -44,6 +46,7 @@ class CoverageLedger:
     targets: Dict[str, CoverageTarget] = field(default_factory=dict)
     covered: Set[str] = field(default_factory=set)
     records: List[LedgerRecord] = field(default_factory=list)
+    reasons: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.coverage_dir = self.code_dir / "coverage"
@@ -108,6 +111,26 @@ class CoverageLedger:
     def register_targets(self, targets: Iterable[CoverageTarget]) -> None:
         for target in targets:
             self.targets[target.key()] = target
+            if target.reason:
+                self.reasons[target.key()] = target.reason
+
+    def record_skip(self, path: str, reason: str) -> None:
+        """Register a skipped path so coverage reports can surface the reason."""
+
+        reason_text = reason.strip() or "skipped"
+        placeholder_hash = hashlib.sha256(f"{path}:{reason_text}".encode("utf-8")).hexdigest()
+        chunk_id = f"{path}#skip@{placeholder_hash[:8]}"
+        target = CoverageTarget(
+            path=path,
+            sha256=placeholder_hash,
+            start_line=1,
+            end_line=1,
+            chunk_id=chunk_id,
+            reason=reason_text,
+        )
+        if target.key() not in self.targets:
+            self.targets[target.key()] = target
+            self.reasons[target.key()] = reason_text
 
     def append_record(
         self,
@@ -149,7 +172,7 @@ class CoverageLedger:
                 if key:
                     self.covered.add(key)
 
-    def build_report(self) -> Dict[str, object]:
+    def build_report(self, review_results: Optional[List[Dict[str, object]]] = None) -> Dict[str, object]:
         total_segments = len(self.targets)
         covered_segments = len(self.covered & set(self.targets.keys()))
         missed_keys = set(self.targets.keys()) - self.covered
@@ -169,7 +192,70 @@ class CoverageLedger:
             dir_stats["total"] += stats["total"]
             dir_stats["covered"] += stats["covered"]
 
-        missed_details = [self.targets[key].__dict__ for key in sorted(missed_keys)]
+        missed_details = []
+        for key in sorted(missed_keys):
+            target = self.targets[key]
+            data = target.__dict__.copy()
+            if reason := self.reasons.get(key):
+                data["reason"] = reason
+            missed_details.append(data)
+
+        reviewed_segments: Dict[str, Dict[str, str]] = {}
+        for record in self.records:
+            if record.status != "ok":
+                continue
+            for entry in record.files:
+                path = entry.get("path")
+                if not isinstance(path, str):
+                    continue
+                reviewed_segments[path] = {
+                    "chunk_id": str(entry.get("chunk_id", "")),
+                    "model": record.model,
+                    "ts": record.ts,
+                }
+
+        reviewed_details = [
+            {"path": path, **info}
+            for path, info in sorted(reviewed_segments.items(), key=lambda item: item[0])
+        ]
+
+        severity_histogram: Dict[str, int] = {}
+        risk_histogram: Dict[str, int] = {str(i): 0 for i in range(1, 11)}
+        issue_hotspots: Dict[str, int] = {}
+
+        review_results = review_results or []
+        for result in review_results:
+            path = result.get("file")
+            reviews = result.get("reviews", [])  # type: ignore[assignment]
+            if not isinstance(reviews, list):
+                continue
+            directory = "."
+            if isinstance(path, str):
+                directory = str(Path(path).parent) or "."
+                issue_hotspots[directory] = issue_hotspots.get(directory, 0) + len(reviews)
+            for review in reviews:
+                if not isinstance(review, dict):
+                    continue
+                severity = str(review.get("severity", "")).lower()
+                if severity:
+                    severity_histogram[severity] = severity_histogram.get(severity, 0) + 1
+                risk_value = review.get("risk_score")
+                try:
+                    risk_int = int(risk_value)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= risk_int <= 10:
+                    risk_histogram[str(risk_int)] += 1
+                else:
+                    risk_histogram.setdefault("other", 0)
+                    risk_histogram["other"] += 1
+
+        issue_hotspots_sorted = [
+            {"directory": directory, "issues": count}
+            for directory, count in sorted(
+                issue_hotspots.items(), key=lambda item: (-item[1], item[0])
+            )
+        ]
 
         report = {
             "commit": self.commit_sha,
@@ -199,6 +285,10 @@ class CoverageLedger:
                 for directory, stats in sorted(per_dir.items())
             },
             "missed": missed_details,
+            "reviewed": reviewed_details,
+            "severity_histogram": severity_histogram,
+            "risk_histogram": risk_histogram,
+            "issue_hotspots": issue_hotspots_sorted,
         }
 
         with self.report_json_path.open("w", encoding="utf-8") as handle:
@@ -240,16 +330,88 @@ class CoverageLedger:
             )
         lines.append("")
 
-        missed: List[Dict[str, object]] = report.get("missed", [])  # type: ignore
-        lines.append("## Missed segments")
+        lines.append("## 未レビューセグメント")
         lines.append("")
+        lines.append("| File | Lines | Chunk | Reason |")
+        lines.append("| --- | --- | --- | --- |")
+        missed: List[Dict[str, object]] = report.get("missed", [])  # type: ignore
         if not missed:
-            lines.append("All registered segments were reviewed.")
+            lines.append("| (none) | - | - | - |")
         else:
             for item in missed:
                 lines.append(
-                    f"- {item['path']} (lines {item['start_line']}-{item['end_line']}, chunk {item['chunk_id']})"
+                    "| {path} | {lines} | {chunk} | {reason} |".format(
+                        path=item.get("path", ""),
+                        lines=f"{item.get('start_line', '-')}-{item.get('end_line', '-')}",
+                        chunk=item.get("chunk_id", ""),
+                        reason=item.get("reason", ""),
+                    )
                 )
+        lines.append("")
+
+        lines.append("## レビュー済みセグメント")
+        lines.append("")
+        lines.append("| File | Chunk | Model | Timestamp |")
+        lines.append("| --- | --- | --- | --- |")
+        reviewed: List[Dict[str, object]] = report.get("reviewed", [])  # type: ignore
+        if not reviewed:
+            lines.append("| (none) | - | - | - |")
+        else:
+            for item in reviewed:
+                lines.append(
+                    "| {path} | {chunk} | {model} | {ts} |".format(
+                        path=item.get("path", ""),
+                        chunk=item.get("chunk_id", ""),
+                        model=item.get("model", ""),
+                        ts=item.get("ts", ""),
+                    )
+                )
+        lines.append("")
+
+        lines.append("## 指摘の多いディレクトリ Top")
+        lines.append("")
+        lines.append("| Directory | Issues |")
+        lines.append("| --- | ---: |")
+        hotspots: List[Dict[str, object]] = report.get("issue_hotspots", [])  # type: ignore
+        if not hotspots:
+            lines.append("| (none) | 0 |")
+        else:
+            for item in hotspots[:10]:
+                lines.append(
+                    "| {directory} | {issues} |".format(
+                        directory=item.get("directory", ""),
+                        issues=item.get("issues", 0),
+                    )
+                )
+        lines.append("")
+
+        lines.append("## 重大度別ヒストグラム")
+        lines.append("")
+        lines.append("| Severity | Findings |")
+        lines.append("| --- | ---: |")
+        severity_histogram: Dict[str, int] = report.get("severity_histogram", {})  # type: ignore
+        non_zero_severity = {k: v for k, v in severity_histogram.items() if v}
+        if not non_zero_severity:
+            lines.append("| (none) | 0 |")
+        else:
+            for severity, count in sorted(non_zero_severity.items(), key=lambda item: (-item[1], item[0])):
+                lines.append(f"| {severity} | {count} |")
+        lines.append("")
+
+        lines.append("## リスクスコア分布")
+        lines.append("")
+        lines.append("| Risk | Findings |")
+        lines.append("| --- | ---: |")
+        risk_histogram: Dict[str, int] = report.get("risk_histogram", {})  # type: ignore
+        non_zero_risk = {k: v for k, v in risk_histogram.items() if v}
+        if not non_zero_risk:
+            lines.append("| (none) | 0 |")
+        else:
+            for risk, count in sorted(
+                non_zero_risk.items(),
+                key=lambda item: (int(item[0]) if item[0].isdigit() else 100, item[0]),
+            ):
+                lines.append(f"| {risk} | {count} |")
         lines.append("")
 
         with self.report_md_path.open("w", encoding="utf-8") as handle:
