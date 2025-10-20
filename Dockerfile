@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY reviewer.py /app/reviewer.py
+COPY . /app
 RUN chmod +x /app/reviewer.py
 
 ENTRYPOINT ["python", "/app/reviewer.py"]
